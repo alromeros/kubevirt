@@ -75,7 +75,7 @@ var _ = Describe("GetVirtualMachineInstanceVolumes", func() {
 	DescribeTable("should handle volume exclusions based on flags",
 		func(hasEFI, hasTPM bool, expectedVolumes []string, ops ...VolumeOption) {
 			vmi := createVMI(hasEFI, hasTPM)
-			volumes := GetVirtualMachineInstanceVolumes(vmi, ops...)
+			volumes, _ := GetVirtualMachineInstanceVolumes(vmi, ops...)
 
 			Expect(volumes).To(HaveLen(len(expectedVolumes)))
 			for i, expectedVolumeName := range expectedVolumes {
