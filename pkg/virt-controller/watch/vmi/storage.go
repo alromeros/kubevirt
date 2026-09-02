@@ -20,6 +20,7 @@
 package vmi
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -51,6 +52,16 @@ func (c *Controller) addPVC(obj interface{}) {
 		c.pvcExpectations.CreationObserved(vmiKey)
 		c.Queue.Add(vmiKey)
 		return // The PVC is a backend-storage PVC, won't be listed by `c.listVMIsMatchingDV()`
+	}
+	// Declarative VMState PVCs created from a volumeClaimTemplate carry the owner-mapping
+	// label and an OwnerReference to the VM (or standalone VMI), both sharing the VMI name.
+	if _, exists := pvc.Labels[backendstorage.VMStateOwnerLabel]; exists {
+		if controllerRef := v1.GetControllerOf(pvc); controllerRef != nil {
+			vmiKey := controller.NamespacedKey(pvc.Namespace, controllerRef.Name)
+			c.pvcExpectations.CreationObserved(vmiKey)
+			c.Queue.Add(vmiKey)
+			return
+		}
 	}
 	vmis, err := c.listVMIsMatchingDV(pvc.Namespace, pvc.Name)
 	if err != nil {
@@ -124,6 +135,11 @@ func (c *Controller) handleBackendStorage(vmi *virtv1.VirtualMachineInstance) (s
 		return "", nil
 	}
 	pvc := backendstorage.PVCForVMI(c.pvcIndexer, vmi)
+
+	if backendstorage.HasDeclarativeVMState(&vmi.Spec) {
+		return c.handleDeclarativeBackendStorage(vmi, key, pvc)
+	}
+
 	if pvc == nil {
 		c.pvcExpectations.ExpectCreations(key, 1)
 		if pvc, err = c.backendStorage.CreatePVCForVMI(vmi); err != nil {
@@ -132,6 +148,70 @@ func (c *Controller) handleBackendStorage(vmi *virtv1.VirtualMachineInstance) (s
 		}
 	}
 	return pvc.Name, nil
+}
+
+// handleDeclarativeBackendStorage creates or adopts the VMState PVC referenced through the
+// declarative virtualMachineState API. A new PVC is only created on the volumeClaimTemplate
+// path when none exists yet; the source path adopts an existing PVC and reports
+// VirtualMachineStatePVCNotFound when the referenced PVC is missing.
+func (c *Controller) handleDeclarativeBackendStorage(vmi *virtv1.VirtualMachineInstance, key string, pvc *k8sv1.PersistentVolumeClaim) (string, common.SyncError) {
+	creating := pvc == nil && vmi.Spec.VirtualMachineState.Source == nil
+	if creating {
+		c.pvcExpectations.ExpectCreations(key, 1)
+	}
+	pvc, err := c.backendStorage.CreatePVCForVMI(vmi)
+	if err != nil {
+		if creating {
+			c.pvcExpectations.CreationObserved(key)
+		}
+		if errors.Is(err, backendstorage.ErrVMStatePVCNotFound) {
+			return "", common.NewSyncError(err, controller.VirtualMachineStatePVCNotFoundReason)
+		}
+		return "", common.NewSyncError(err, controller.FailedBackendStorageCreateReason)
+	}
+	if syncErr := c.acquireVMStateLock(vmi, pvc); syncErr != nil {
+		return "", syncErr
+	}
+	return pvc.Name, nil
+}
+
+// TODO(declarative-vmstate): the in-use lock scheme below (liveness-based reclaim, no
+// explicit release, full VMI-store scan to resolve the holder) is provisional and a
+// candidate for refinement. See VEP #312.
+
+// acquireVMStateLock ensures the current VMI holds the in-use lock on its VMState PVC,
+// preventing two running VMs from writing the same state. If the lock is held by a different
+// VMI that is still running, the VMI is blocked from starting and the reason is surfaced; a
+// lock left behind by a no-longer-running holder is reclaimed.
+func (c *Controller) acquireVMStateLock(vmi *virtv1.VirtualMachineInstance, pvc *k8sv1.PersistentVolumeClaim) common.SyncError {
+	holder := pvc.Labels[backendstorage.VMStateInUseByLabel]
+	if holder == string(vmi.UID) {
+		return nil
+	}
+	if holder != "" && c.isVMStateHolderRunning(vmi.Namespace, holder) {
+		return common.NewSyncError(
+			fmt.Errorf("VirtualMachineState PVC %s is already in use by another running VirtualMachine", pvc.Name),
+			controller.VirtualMachineStateInUseReason,
+		)
+	}
+	if err := c.backendStorage.AcquireVMStateLock(pvc, string(vmi.UID)); err != nil {
+		return common.NewSyncError(err, controller.FailedBackendStorageCreateReason)
+	}
+	return nil
+}
+
+// isVMStateHolderRunning reports whether a VMI with the given UID still exists and is not
+// terminating in the namespace, i.e. whether an in-use lock it holds is still valid. The
+// holder's liveness, not the mere presence of the lock label, is the source of truth.
+func (c *Controller) isVMStateHolderRunning(namespace, holderUID string) bool {
+	for _, obj := range c.vmiIndexer.List() {
+		other := obj.(*virtv1.VirtualMachineInstance)
+		if other.Namespace != namespace || string(other.UID) != holderUID {
+			continue
+		}
+		return !other.IsFinal() && other.DeletionTimestamp == nil
+	}
+	return false
 }
 
 func (c *Controller) processHotplugVolumeStatus(
@@ -338,6 +418,17 @@ func (c *Controller) updateVolumeStatus(vmi *virtv1.VirtualMachineInstance, virt
 		return strings.Compare(newStatus[i].Name, newStatus[j].Name) == -1
 	})
 	vmi.Status.VolumeStatus = newStatus
+
+	// Surface the backend-storage (VirtualMachineState) volume in its dedicated status field,
+	// for both the declarative and implicit paths. Status is the source of truth for the live
+	// PVC name, which may differ from the referenced source after a migration.
+	vmi.Status.VirtualMachineStateVolume = nil
+	for i := range newStatus {
+		if backendstorage.IsBackendStorageVolume(newStatus[i]) {
+			vmi.Status.VirtualMachineStateVolume = newStatus[i].DeepCopy()
+			break
+		}
+	}
 	return nil
 }
 
