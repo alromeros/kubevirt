@@ -429,6 +429,21 @@ func withBackendStorage(vmi *v1.VirtualMachineInstance, backendStoragePVCName st
 			})
 		}
 
+		if util.HasDeclarativeVMState(vmi) {
+			// Declarative virtualMachineState: mount the whole PVC (no SubPath) exposing the
+			// canonical VM-agnostic layout (tpm/, efi/, cbt/, swtpm-localca/, meta/). Per-feature
+			// state is reached via canonical subdirectories (EFI NVRAM and CBT paths point into
+			// the mount directly) and ephemeral symlinks that virt-launcher creates before libvirt
+			// starts (TPM, swtpm-localca), since those libvirt paths are not configurable.
+			renderer.podVolumeMounts = append(renderer.podVolumeMounts, k8sv1.VolumeMount{
+				Name:      volumeName,
+				ReadOnly:  false,
+				MountPath: util.VMStatePVCMountPath,
+			})
+
+			return nil
+		}
+
 		if tpm.HasPersistentDevice(&vmi.Spec) {
 			renderer.podVolumeMounts = append(renderer.podVolumeMounts, k8sv1.VolumeMount{
 				Name:      volumeName,

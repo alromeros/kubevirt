@@ -358,11 +358,19 @@ func CurrentPVCName(vmi *corev1.VirtualMachineInstance) string {
 }
 
 func HasPersistentEFI(vmiSpec *corev1.VirtualMachineInstanceSpec) bool {
-	return vmiSpec.Domain.Firmware != nil &&
-		vmiSpec.Domain.Firmware.Bootloader != nil &&
-		vmiSpec.Domain.Firmware.Bootloader.EFI != nil &&
-		vmiSpec.Domain.Firmware.Bootloader.EFI.Persistent != nil &&
-		*vmiSpec.Domain.Firmware.Bootloader.EFI.Persistent
+	if vmiSpec.Domain.Firmware == nil ||
+		vmiSpec.Domain.Firmware.Bootloader == nil ||
+		vmiSpec.Domain.Firmware.Bootloader.EFI == nil {
+		return false
+	}
+	persistent := vmiSpec.Domain.Firmware.Bootloader.EFI.Persistent
+	// When the declarative virtualMachineState API is used, providing a state PVC
+	// implies the EFI state should be kept, so it is persistent unless explicitly
+	// opted out with persistent: false. See VEP #312.
+	if HasDeclarativeVMState(vmiSpec) {
+		return persistent == nil || *persistent
+	}
+	return persistent != nil && *persistent
 }
 
 func IsBackendStorageNeeded(obj interface{}) bool {

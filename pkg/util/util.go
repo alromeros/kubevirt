@@ -39,7 +39,49 @@ const (
 	ENV_VAR_LIBVIRT_DEBUG_LOGS          = "LIBVIRT_DEBUG_LOGS"
 	ENV_VAR_VIRTIOFSD_DEBUG_LOGS        = "VIRTIOFSD_DEBUG_LOGS"
 	ENV_VAR_VIRT_LAUNCHER_LOG_VERBOSITY = "VIRT_LAUNCHER_LOG_VERBOSITY"
+
+	// VMStatePVCMountPath is the in-pod mount point where the whole VirtualMachineState PVC
+	// is mounted (no SubPath) when the declarative virtualMachineState API is used, exposing
+	// the canonical VM-agnostic layout. See VEP #312.
+	VMStatePVCMountPath = VirtPrivateDir + "/vm-state"
+
+	// Canonical subdirectories/files inside the VirtualMachineState PVC. These are
+	// VM-agnostic so a PVC can be reused/adopted across VMs.
+	VMStateDirTPM          = "tpm"
+	VMStateDirEFI          = "efi"
+	VMStateDirCBT          = "cbt"
+	VMStateDirMeta         = "meta"
+	VMStateDirSwtpmLocalca = "swtpm-localca"
+	VMStateEFIVarsFile     = "efi_vars.fd"
 )
+
+// HasDeclarativeVMState reports whether the VMI opts into the declarative
+// virtualMachineState API, which selects the canonical whole-volume PVC layout.
+func HasDeclarativeVMState(vmi *v1.VirtualMachineInstance) bool {
+	return vmi.Spec.VirtualMachineState != nil
+}
+
+// VMStateCanonicalTPMPath returns the canonical TPM state directory inside the mounted
+// VirtualMachineState PVC. Libvirt reaches it through an ephemeral symlink created by
+// virt-launcher (PathForSwtpm(vmi)/<vm-uuid> -> here), since the swtpm state path is not
+// configurable in domain XML.
+func VMStateCanonicalTPMPath() string {
+	return filepath.Join(VMStatePVCMountPath, VMStateDirTPM)
+}
+
+// VMStateCanonicalSwtpmLocalcaPath returns the canonical swtpm local-CA directory inside the
+// mounted VirtualMachineState PVC. Reached through an ephemeral symlink from
+// PathForSwtpmLocalca(vmi).
+func VMStateCanonicalSwtpmLocalcaPath() string {
+	return filepath.Join(VMStatePVCMountPath, VMStateDirSwtpmLocalca)
+}
+
+// VMStateCanonicalEFIVarsPath returns the canonical EFI NVRAM vars file inside the mounted
+// VirtualMachineState PVC. The NVRAM path is set directly in domain XML, so no symlink is
+// needed.
+func VMStateCanonicalEFIVarsPath() string {
+	return filepath.Join(VMStatePVCMountPath, VMStateDirEFI, VMStateEFIVarsFile)
+}
 
 // Check if a VMI spec requests VirtIO-FS
 func IsVMIVirtiofsEnabled(vmi *v1.VirtualMachineInstance) bool {

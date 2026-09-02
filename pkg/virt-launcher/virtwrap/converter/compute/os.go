@@ -129,7 +129,7 @@ func (o OSDomainConfigurator) configureEFI(vmi *v1.VirtualMachineInstance, domai
 		if vmi.Spec.Architecture != "arm64" {
 			domain.Spec.OS.NVRam = &api.NVRam{
 				Format: "raw",
-				NVRam:  filepath.Join(util.PathForNVram(vmi), vmi.Name+"_VARS.fd"),
+				NVRam:  nvramPath(vmi),
 			}
 		}
 		return
@@ -149,9 +149,20 @@ func (o OSDomainConfigurator) configureEFI(vmi *v1.VirtualMachineInstance, domai
 		domain.Spec.OS.BootLoader.Type = "pflash"
 		domain.Spec.OS.NVRam = &api.NVRam{
 			Template: o.efiConfiguration.EFIVars,
-			NVRam:    filepath.Join(util.PathForNVram(vmi), vmi.Name+"_VARS.fd"),
+			NVRam:    nvramPath(vmi),
 		}
 	}
+}
+
+// nvramPath returns the domain-XML NVRAM (EFI vars) file path. With the declarative
+// virtualMachineState API the PVC is mounted whole in the canonical layout, so NVRAM lives at
+// the VM-agnostic <mount>/efi/efi_vars.fd. Otherwise it keeps KubeVirt's per-VM implicit
+// convention of <PathForNVram>/<vmName>_VARS.fd.
+func nvramPath(vmi *v1.VirtualMachineInstance) string {
+	if util.HasDeclarativeVMState(vmi) {
+		return util.VMStateCanonicalEFIVarsPath()
+	}
+	return filepath.Join(util.PathForNVram(vmi), vmi.Name+"_VARS.fd")
 }
 
 func configureBIOS(firmware *v1.Firmware, domain *api.Domain) {
