@@ -53,6 +53,29 @@ const (
 	VMStateDirMeta         = "meta"
 	VMStateDirSwtpmLocalca = "swtpm-localca"
 	VMStateEFIVarsFile     = "efi_vars.fd"
+
+	// VMStateDirNVRAMLegacy is the implicit-path NVRAM subdirectory name inside a legacy
+	// VMState PVC. It holds <vmname>_VARS.fd, which virt-launcher normalizes to
+	// efi/efi_vars.fd on the first boot after opting into the declarative API. See VEP #312.
+	VMStateDirNVRAMLegacy = "nvram"
+
+	// VMStateDirSwtpmLegacy is the implicit-path swtpm subdirectory name inside a legacy
+	// VMState PVC. It holds the per-VM <uuid>/tpm2 state, which virt-launcher normalizes to
+	// tpm/ on the first boot after opting into the declarative API. See VEP #312.
+	VMStateDirSwtpmLegacy = "swtpm"
+
+	// VMStateFileLayout is the file inside meta/ that records the PVC's canonical layout version
+	// (VMStateLayoutVersion). See VEP #312.
+	VMStateFileLayout = "layout"
+
+	// VMStateLayoutVersion is the current on-disk layout version of a declarative
+	// VirtualMachineState PVC. virt-launcher stamps it into meta/layout once the PVC is in the
+	// canonical layout, and treats it as the authoritative "already normalized" signal: a boot
+	// that reads the current version skips legacy normalization entirely instead of re-inferring
+	// the layout from the directory shape. If the canonical layout ever changes, bump this and
+	// key the migration off the recorded version so it stays deterministic rather than sniffing
+	// directories (the fragile pattern this marker exists to retire). See VEP #312.
+	VMStateLayoutVersion = 1
 )
 
 // HasDeclarativeVMState reports whether the VMI opts into the declarative

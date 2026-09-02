@@ -35,6 +35,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -1082,6 +1083,14 @@ func (l *LibvirtDomainManager) prepareVMStateLayout(vmi *v1.VirtualMachineInstan
 
 	logger := log.Log.Object(vmi)
 
+	// Normalize a legacy (implicit-path) PVC to the canonical layout before creating any
+	// canonical directories, so the per-feature idempotency gates (skip if tpm/ or
+	// efi/efi_vars.fd already exist) still see the pre-migration state. On a fresh
+	// template-created PVC there are no legacy artifacts, so this is a no-op.
+	if err := l.normalizeLegacyVMStateLayout(vmi); err != nil {
+		return err
+	}
+
 	// Ensure the canonical subdirectories exist. They are VM-agnostic so a PVC can be
 	// reused/adopted across VMs. If virtualMachineState is set with no TPM/EFI/CBT, the PVC is
 	// left with empty canonical directories.
@@ -1167,6 +1176,219 @@ func ensureVMStateSymlink(target, link string) error {
 		return err
 	}
 	return nil
+}
+
+// legacyTPMUUIDDirRegex matches the per-VM TPM state directory names of the legacy VMState PVC
+// layout, where TPM state lives under <uuid>/tpm2/.
+var legacyTPMUUIDDirRegex = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// normalizeLegacyVMStateLayout performs a one-time, idempotent rewrite of a legacy (implicit-path)
+// VMState PVC into the canonical VM-agnostic layout, triggered when a VM opts into the declarative
+// virtualMachineState API pointing at a pre-existing PVC. The meta/layout version marker is the
+// authoritative "already normalized" signal: once it records the current version there is nothing
+// to migrate, so the (legacy) directory sniffing is skipped entirely. Without it, TPM and EFI are
+// migrated independently, each additionally guarded by its own idempotency gate (the canonical
+// target already existing) so a crash between the renames and the version stamp is safe to retry.
+// The PVC filesystem is the source of truth: a fresh template-created PVC has no legacy artifacts,
+// so migration is a no-op and only the version marker is written. See VEP #312.
+func (l *LibvirtDomainManager) normalizeLegacyVMStateLayout(vmi *v1.VirtualMachineInstance) error {
+	root := kutil.VMStatePVCMountPath
+	logger := log.Log.Object(vmi)
+
+	// A PVC already at (or ahead of) the current layout version needs no migration. A
+	// newer-than-current version means an older launcher met a PVC written by a newer one; leave
+	// it untouched rather than risk mishandling a layout we do not understand.
+	version, err := readVMStateLayoutVersion(root)
+	if err != nil {
+		return err
+	}
+	if version >= kutil.VMStateLayoutVersion {
+		return nil
+	}
+
+	if err := l.normalizeLegacyTPM(logger, root); err != nil {
+		return err
+	}
+	if err := normalizeLegacyEFI(logger, root); err != nil {
+		return err
+	}
+
+	// Record the canonical layout version so subsequent boots skip normalization and a future
+	// launcher can migrate deterministically off the recorded version.
+	return writeVMStateLayoutVersion(root, kutil.VMStateLayoutVersion)
+}
+
+// readVMStateLayoutVersion returns the canonical layout version recorded in meta/layout, or 0 when
+// the marker is absent (a legacy or pre-marker PVC). A present-but-unparseable marker is treated as
+// a corruption to fail on rather than silently guess around, matching how the rest of normalization
+// refuses to proceed on ambiguous on-disk state.
+func readVMStateLayoutVersion(root string) (int, error) {
+	data, err := os.ReadFile(filepath.Join(root, kutil.VMStateDirMeta, kutil.VMStateFileLayout))
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("failed to read VMState layout marker: %v", err)
+	}
+	version, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse VMState layout marker %q: %v", string(data), err)
+	}
+	return version, nil
+}
+
+// writeVMStateLayoutVersion records the canonical layout version in meta/layout, writing to a
+// temporary file and renaming into place so a crash mid-write can never leave a truncated marker.
+func writeVMStateLayoutVersion(root string, version int) error {
+	metaDir := filepath.Join(root, kutil.VMStateDirMeta)
+	if err := os.MkdirAll(metaDir, 0755); err != nil {
+		return fmt.Errorf("failed to create VMState meta directory: %v", err)
+	}
+	marker := filepath.Join(metaDir, kutil.VMStateFileLayout)
+	tmp := marker + ".tmp"
+	if err := os.WriteFile(tmp, []byte(strconv.Itoa(version)+"\n"), 0644); err != nil {
+		return fmt.Errorf("failed to write VMState layout marker: %v", err)
+	}
+	if err := os.Rename(tmp, marker); err != nil {
+		return fmt.Errorf("failed to commit VMState layout marker: %v", err)
+	}
+	return nil
+}
+
+// normalizeLegacyTPM renames a single legacy per-VM TPM directory (swtpm/<uuid>, holding tpm2/) to
+// the canonical tpm/ directory, using a two-phase rename (→ tpm.migrating → tpm) so a crash
+// mid-rename can never leave a half-migrated directory. It is skipped if tpm/ already exists.
+func (l *LibvirtDomainManager) normalizeLegacyTPM(logger *log.FilteredLogger, root string) error {
+	tpmCanonical := filepath.Join(root, kutil.VMStateDirTPM)
+	if exists, err := dirExists(tpmCanonical); err != nil {
+		return fmt.Errorf("failed to stat canonical TPM directory: %v", err)
+	} else if exists {
+		return nil
+	}
+
+	// Recover from a crash between the two rename phases: if a staged directory is present,
+	// finish promoting it to the canonical name.
+	migrating := tpmCanonical + ".migrating"
+	if exists, err := dirExists(migrating); err != nil {
+		return fmt.Errorf("failed to stat staged TPM directory: %v", err)
+	} else if exists {
+		if err := os.Rename(migrating, tpmCanonical); err != nil {
+			return fmt.Errorf("failed to recover staged legacy TPM directory: %v", err)
+		}
+		logger.Info("recovered staged legacy TPM directory to canonical tpm/")
+		return nil
+	}
+
+	uuidDirs, err := findLegacyTPMUUIDDirs(root)
+	if err != nil {
+		return err
+	}
+	switch len(uuidDirs) {
+	case 0:
+		// EFI-only or fresh PVC: nothing to migrate.
+		return nil
+	case 1:
+		legacyTPMDir := filepath.Join(root, kutil.VMStateDirSwtpmLegacy, uuidDirs[0])
+		if err := os.Rename(legacyTPMDir, migrating); err != nil {
+			return fmt.Errorf("failed to stage legacy TPM directory: %v", err)
+		}
+		if err := os.Rename(migrating, tpmCanonical); err != nil {
+			return fmt.Errorf("failed to promote legacy TPM directory: %v", err)
+		}
+		logger.Infof("normalized legacy TPM state directory %q to canonical tpm/", uuidDirs[0])
+		return nil
+	default:
+		// Ambiguous: virt-launcher can't tell which UUID directory is the real one. Leave them
+		// in place for manual recovery and start from fresh state.
+		// TODO(declarative-vmstate): VEP #312 asks for a warning *event* on the VMI here, but the
+		// launcher's domain manager has no event recorder, so we log a warning instead.
+		logger.Warningf("found multiple legacy TPM UUID directories %v in the VMState PVC; cannot determine which to adopt, starting from fresh TPM state and leaving them in place", uuidDirs)
+		return nil
+	}
+}
+
+// normalizeLegacyEFI renames a legacy nvram/<vmname>_VARS.fd file to the canonical
+// efi/efi_vars.fd. It is skipped if efi/efi_vars.fd already exists.
+func normalizeLegacyEFI(logger *log.FilteredLogger, root string) error {
+	efiCanonical := kutil.VMStateCanonicalEFIVarsPath()
+	if _, err := os.Stat(efiCanonical); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("failed to stat canonical EFI vars file: %v", err)
+	}
+
+	legacyVars, err := findLegacyNVRAMVarsFile(root)
+	if err != nil {
+		return err
+	}
+	if legacyVars == "" {
+		return nil
+	}
+
+	if err := os.MkdirAll(filepath.Join(root, kutil.VMStateDirEFI), 0755); err != nil {
+		return fmt.Errorf("failed to create canonical efi directory: %v", err)
+	}
+	if err := os.Rename(legacyVars, efiCanonical); err != nil {
+		return fmt.Errorf("failed to normalize legacy EFI vars file: %v", err)
+	}
+	logger.Infof("normalized legacy EFI vars file %q to canonical efi/efi_vars.fd", legacyVars)
+	return nil
+}
+
+// findLegacyTPMUUIDDirs returns the names of UUID-formatted subdirectories under the legacy
+// swtpm/ directory of the VMState PVC, which in the legacy layout hold per-VM TPM state
+// (swtpm/<uuid>/tpm2). A missing swtpm/ directory (fresh or EFI-only PVC) yields no matches.
+// lost+found and non-UUID entries are ignored.
+func findLegacyTPMUUIDDirs(root string) ([]string, error) {
+	swtpmDir := filepath.Join(root, kutil.VMStateDirSwtpmLegacy)
+	entries, err := os.ReadDir(swtpmDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to read legacy swtpm directory: %v", err)
+	}
+	var dirs []string
+	for _, e := range entries {
+		if !e.IsDir() || e.Name() == "lost+found" {
+			continue
+		}
+		if legacyTPMUUIDDirRegex.MatchString(e.Name()) {
+			dirs = append(dirs, e.Name())
+		}
+	}
+	return dirs, nil
+}
+
+// findLegacyNVRAMVarsFile returns the absolute path of the legacy EFI vars file
+// (nvram/<vmname>_VARS.fd) inside the VMState PVC, or "" if there is none.
+func findLegacyNVRAMVarsFile(root string) (string, error) {
+	nvramDir := filepath.Join(root, kutil.VMStateDirNVRAMLegacy)
+	entries, err := os.ReadDir(nvramDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to read legacy nvram directory: %v", err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), "_VARS.fd") {
+			return filepath.Join(nvramDir, e.Name()), nil
+		}
+	}
+	return "", nil
+}
+
+// dirExists reports whether path exists (as any file type). It distinguishes a genuine absence
+// from a stat error so callers can treat I/O problems as failures rather than "not present".
+func dirExists(path string) (bool, error) {
+	if _, err := os.Stat(path); err == nil {
+		return true, nil
+	} else if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	} else {
+		return false, err
+	}
 }
 
 func isPVCBacked(volumeName string, vmi *v1.VirtualMachineInstance) bool {
