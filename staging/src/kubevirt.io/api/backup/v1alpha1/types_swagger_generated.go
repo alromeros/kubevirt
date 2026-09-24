@@ -87,5 +87,6 @@ func (VirtualMachineBackupStatus) SwaggerDoc() map[string]string {
 		"endpointCert":    "+optional\nEndpointCert is the raw CACert that is to be used when connecting\nto an exported backup endpoint in pull mode.",
 		"includedVolumes": "+optional\n+listType=atomic\nIncludedVolumes lists the volumes that were included in the backup",
 		"exportUID":       "+optional\nExportUID tracks the UID of the associated VMExport for pull-mode backups\nused to detect VMExport recreation and re-initiate the export handshake",
+		"offline":         "+optional\nOffline is set to true when the backup was taken while the VM was stopped\n(no running VMI), using persisted QCOW2 dirty bitmaps served by qemu-nbd.",
 	}
 }

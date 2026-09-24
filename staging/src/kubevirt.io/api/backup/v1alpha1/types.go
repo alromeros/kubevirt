@@ -245,6 +245,10 @@ type VirtualMachineBackupStatus struct {
 	// ExportUID tracks the UID of the associated VMExport for pull-mode backups
 	// used to detect VMExport recreation and re-initiate the export handshake
 	ExportUID *types.UID `json:"exportUID,omitempty"`
+	// +optional
+	// Offline is set to true when the backup was taken while the VM was stopped
+	// (no running VMI), using persisted QCOW2 dirty bitmaps served by qemu-nbd.
+	Offline *bool `json:"offline,omitempty"`
 }
 
 // ConditionType is the const type for Conditions
