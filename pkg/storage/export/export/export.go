@@ -77,15 +77,20 @@ const (
 	failedKeyFromObjectFmt = "failed to get key from object: %v, %v"
 	enqueuedForSyncFmt     = "enqueued %q for sync"
 
-	pvcNotFoundReason         = "PVCNotFound"
-	pvcBoundReason            = "PVCBound"
-	pvcPendingReason          = "PVCPending"
-	unknownReason             = "Unknown"
-	initializingReason        = "Initializing"
-	inUseReason               = "InUse"
-	podPendingReason          = "PodPending"
-	podReadyReason            = "PodReady"
-	podCompletedReason        = "PodCompleted"
+	pvcNotFoundReason  = "PVCNotFound"
+	pvcBoundReason     = "PVCBound"
+	pvcPendingReason   = "PVCPending"
+	unknownReason      = "Unknown"
+	initializingReason = "Initializing"
+	inUseReason        = "InUse"
+	podPendingReason   = "PodPending"
+	podReadyReason     = "PodReady"
+	podCompletedReason = "PodCompleted"
+	// podFailedReason is the Ready-condition reason set on an offline-push
+	// VMExport when its export pod fails. The backup controller
+	// (pkg/storage/cbt) mirrors this string to detect the failure; it cannot
+	// import this package (that would create a cycle via backend-storage).
+	podFailedReason           = "PodFailed"
 	vmNotFoundReason          = "VMNotFound"
 	volumesNotPopulatedReason = "VolumesNotPopulated"
 	noVolumeVMReason          = "VMNoVolumes"
@@ -732,6 +737,13 @@ func (ctrl *VMExportController) updateVMExport(vmExport *exportv1.VirtualMachine
 		if vmBackup.Status == nil || vmBackup.Status.Type == "" {
 			return 0, fmt.Errorf("backup status empty")
 		}
+		if isOfflineBackup(vmBackup) {
+			source, err := ctrl.getOfflineBackupSource(vmExport, vmBackup)
+			if err != nil {
+				return 0, err
+			}
+			return ctrl.handleSource(vmExport, source)
+		}
 		caCert, exists, err := ctrl.backupCA()
 		if err != nil || !exists {
 			return 0, fmt.Errorf("could not obtain VirtualMachineBackup tunnel CA: %w", err)
@@ -785,7 +797,7 @@ func (ctrl *VMExportController) manageExporterPod(vmExport *exportv1.VirtualMach
 		}
 
 		if source.IsSourceAvailable() {
-			if err := ctrl.checkPod(vmExport, pod); err != nil {
+			if err := ctrl.checkPod(vmExport, pod, source); err != nil {
 				return nil, err
 			}
 		} else {
@@ -807,7 +819,7 @@ func (ctrl *VMExportController) deleteExporterPod(vmExport *exportv1.VirtualMach
 	return nil
 }
 
-func (ctrl *VMExportController) checkPod(vmExport *exportv1.VirtualMachineExport, pod *corev1.Pod) error {
+func (ctrl *VMExportController) checkPod(vmExport *exportv1.VirtualMachineExport, pod *corev1.Pod, source exportSource) error {
 	if pod.DeletionTimestamp != nil {
 		return nil
 	}
@@ -820,6 +832,13 @@ func (ctrl *VMExportController) checkPod(vmExport *exportv1.VirtualMachineExport
 	}
 
 	if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+		// An offline push exporter is a one-shot job: keep its terminal pod so the export
+		// status stays stable for the backup controller to observe (Terminated on success,
+		// the podFailedReason Ready condition on failure). Recycling it would either loop
+		// the backup forever or hide the outcome.
+		if offline, ok := source.(*OfflineVMBackupSource); ok && offline.isPush() {
+			return nil
+		}
 		// The server died or completed, delete the pod.
 		return ctrl.deleteExporterPod(vmExport, pod, exporterPodFailedOrCompletedEvent, fmt.Sprintf("Exporter pod %s/%s is in phase %s", pod.Namespace, pod.Name, pod.Status.Phase))
 	}
@@ -1545,6 +1564,13 @@ func (ctrl *VMExportController) updateCommonVMExportStatusFields(vmExport, vmExp
 		} else if exporterPod.Status.Phase == corev1.PodSucceeded {
 			vmExportCopy.Status.Conditions = updateCondition(vmExportCopy.Status.Conditions, newReadyCondition(corev1.ConditionFalse, podCompletedReason, ""))
 			vmExportCopy.Status.Phase = exportv1.Terminated
+		} else if offline, ok := source.(*OfflineVMBackupSource); ok && offline.isPush() && exporterPod.Status.Phase == corev1.PodFailed {
+			// The export API has no Failed phase; a one-shot offline-push exporter that
+			// fails surfaces here via the Ready reason so the backup controller (which
+			// cannot see the pod) can fail the backup. Phase stays Pending. Other sources
+			// keep the generic handling below.
+			vmExportCopy.Status.Conditions = updateCondition(vmExportCopy.Status.Conditions, newReadyCondition(corev1.ConditionFalse, podFailedReason, ""))
+			vmExportCopy.Status.Phase = exportv1.Pending
 		} else if exporterPod.Status.Phase == corev1.PodPending {
 			vmExportCopy.Status.Conditions = updateCondition(vmExportCopy.Status.Conditions, newReadyCondition(corev1.ConditionFalse, podPendingReason, ""))
 			vmExportCopy.Status.Phase = exportv1.Pending
