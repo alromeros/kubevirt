@@ -59,8 +59,6 @@ import (
 
 	nbdv1 "kubevirt.io/kubevirt/pkg/storage/cbt/nbd/v1"
 
-	backupv1 "kubevirt.io/api/backup/v1alpha1"
-
 	"kubevirt.io/kubevirt/pkg/safepath"
 	"kubevirt.io/kubevirt/pkg/service"
 	"kubevirt.io/kubevirt/pkg/storage/export/export"
@@ -111,6 +109,14 @@ type ExportServerConfig struct {
 	BackupType       string
 	BackupCheckpoint string
 
+	OfflineBackup        bool
+	BackupStatePath      string
+	SocketDir            string
+	BackupBaseCheckpoint string
+	BackupMode           string
+	BackupTargetDir      string
+	BackupName           string
+
 	Paths *export.ServerPaths
 
 	// unit testing helpers
@@ -144,6 +150,8 @@ type exportServer struct {
 	tunnelEstablished bool
 	nbdMu             sync.RWMutex
 	ociBuilder        *oci.Builder
+
+	offline *offlineDataPlane
 }
 
 func (er *execReader) Read(p []byte) (int, error) {
@@ -254,14 +262,28 @@ func (s *exportServer) getHandlerMap(vi export.VolumeInfo) map[string]http.Handl
 }
 
 func (s *exportServer) Run() {
-	s.initHandler()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	if !s.Deadline.IsZero() {
 		log.Log.Infof("Deadline set to %s", s.Deadline)
 		ctx, cancel = context.WithDeadline(ctx, s.Deadline)
 	}
 	defer cancel()
+
+	if s.OfflineBackup {
+		if s.isOfflinePush() {
+			if err := s.runOfflinePush(ctx); err != nil {
+				panic(err)
+			}
+			log.Log.Info("Offline push backup completed")
+			return
+		}
+		if err := s.startOfflineDataPlane(ctx); err != nil {
+			panic(err)
+		}
+		defer s.offline.stop()
+	}
+
+	s.initHandler()
 
 	srv := s.buildServer(ctx)
 
@@ -304,7 +326,7 @@ func (s *exportServer) buildServer(ctx context.Context) *http.Server {
 	}
 
 	rootHandler := s.handler
-	if s.BackupUID != "" {
+	if s.BackupUID != "" && !s.OfflineBackup {
 		clientCAPool := x509.NewCertPool()
 		if ok := clientCAPool.AppendCertsFromPEM(s.BackupCACert); !ok {
 			panic("failed to parse Backup CA")
@@ -1104,10 +1126,7 @@ func (s *exportServer) backupMapHandler(exportName string) http.Handler {
 			pageSize = p
 		}
 
-		var bitmapName string
-		if s.BackupType == string(backupv1.Incremental) && s.BackupCheckpoint != "" {
-			bitmapName = s.BackupCheckpoint
-		}
+		bitmapName := s.backupBitmapName()
 
 		streamCtx, streamCancel := context.WithCancel(req.Context())
 		defer streamCancel()
